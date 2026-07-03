@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 # The Cloud Run runtime service account must be a member of (or have the target
 # folder shared to it on) the Circles of Support Shared Drive with at least
 # Content Manager, or the upload 404s/403s.
+#
+# Output shape: the restore-capable definitions bundle (flows/campaigns/triggers/
+# groups/fields from definitions.json?dependencies=all) PLUS a top-level
+# `flow_index` array — per-flow list-metadata from flows.json including the
+# `archived` flag, which the definitions bundle does NOT carry. flow_index makes
+# the backup (a) a true-state record (which flows were archived at backup time)
+# and (b) a next-day reference (greppable uuid→name/status/modified_on map)
+# without parsing the full definitions. Costs zero extra API calls — the flows.json
+# pagination already runs to collect UUIDs; it now retains the metadata too.
 # ---------------------------------------------------------------------------
 
 TEXTIT_BASE = "https://textit.com/api/v2"
@@ -54,24 +63,48 @@ def _headers():
     return {"Authorization": f"Token {TEXTIT_TOKEN}"}
 
 
-def collect_flow_uuids():
-    """GET /flows.json paginated; collect + dedupe all flow UUIDs.
-    Raises if zero — empty-backup guard (matches PS script)."""
+# Per-flow metadata fields kept from the flows.json list endpoint. This is the
+# flow-LIST metadata (archive state, name, timestamps, run counts) — NOT present
+# in the definitions.json?dependencies=all bundle, which carries flow *logic* but
+# no `archived` field. Capturing it here adds ZERO extra API calls: the backup
+# already paginates flows.json to collect UUIDs; it previously discarded
+# everything except the uuid. See RapidPro/TextIt API v2 flows endpoint schema.
+FLOW_INDEX_FIELDS = [
+    "uuid", "name", "type", "archived",
+    "created_on", "modified_on", "expires", "runs", "labels",
+]
+
+
+def collect_flows():
+    """GET /flows.json paginated; return (uuids, flow_index).
+
+    uuids: deduped list of flow UUIDs (drives definitions.json batching).
+    flow_index: per-flow list-metadata (uuid, name, type, ARCHIVED, timestamps,
+    run counts, labels) — the archive-state + next-day-reference layer. Reuses
+    the same pagination; no extra API calls.
+
+    Raises if zero flows — empty-backup guard (matches PS script)."""
     uuids = []
+    flow_index = []
+    seen = set()
     nxt = f"{TEXTIT_BASE}/flows.json?page_size={PAGE_SIZE}"
     while nxt:
         resp = requests.get(nxt, headers=_headers(), timeout=120)
         resp.raise_for_status()
         data = resp.json()
         for f in data.get("results", []):
-            if f.get("uuid"):
-                uuids.append(f["uuid"])
+            uuid = f.get("uuid")
+            if not uuid or uuid in seen:
+                continue
+            seen.add(uuid)
+            uuids.append(uuid)
+            flow_index.append({k: f.get(k) for k in FLOW_INDEX_FIELDS})
         nxt = data.get("next")
-    uuids = list(dict.fromkeys(uuids))  # dedupe, preserve order
-    logger.info(f"{len(uuids)} flow UUIDs collected")
+    archived_count = sum(1 for f in flow_index if f.get("archived"))
+    logger.info(f"{len(uuids)} flows collected ({archived_count} archived)")
     if not uuids:
-        raise RuntimeError("No flow UUIDs returned from flows.json — aborting (empty backup guard).")
-    return uuids
+        raise RuntimeError("No flows returned from flows.json — aborting (empty backup guard).")
+    return uuids, flow_index
 
 
 def pull_definitions(uuids):
@@ -158,15 +191,35 @@ def upload_to_drive(filename, content_bytes):
 # ---------------------------------------------------------------------------
 
 def run_backup():
-    uuids = collect_flow_uuids()
+    uuids, flow_index = collect_flows()
     batches = pull_definitions(uuids)
     merged = merge_batches(batches)
 
+    # Fold the flow-list metadata (archive state + reference index) in as a
+    # top-level key alongside the restore-capable definitions collections. The
+    # definitions collections are untouched — restore fidelity is unchanged. A
+    # recovery that parses the backup for individual flows reads `flows` and
+    # ignores `flow_index`; nothing hands the whole file to TextIt's importer,
+    # so the extra key is safe.
+    merged["flow_index"] = flow_index
+    merged["backed_up_on"] = datetime.now(timezone.utc).isoformat()
+
     counts = {c: len(merged[c]) for c in COLLECTIONS}
-    count_mismatch = merged["flows"].__len__() != len(uuids)
+    archived_count = sum(1 for f in flow_index if f.get("archived"))
+
+    # Sanity checks (warn, don't silently pass):
+    # 1. every collected flow should appear in the restore-capable definitions.
+    count_mismatch = len(merged["flows"]) != len(uuids)
     if count_mismatch:
         logger.warning(
-            f"Merged flow count ({len(merged['flows'])}) != collected UUID count "
+            f"Merged flow count ({len(merged['flows'])}) != collected flow count "
+            f"({len(uuids)}). Inspect before trusting this backup."
+        )
+    # 2. flow_index should have one entry per collected flow.
+    index_mismatch = len(flow_index) != len(uuids)
+    if index_mismatch:
+        logger.warning(
+            f"flow_index count ({len(flow_index)}) != collected flow count "
             f"({len(uuids)}). Inspect before trusting this backup."
         )
 
@@ -183,8 +236,11 @@ def run_backup():
         "drive_file_id": file_id,
         "bytes": len(content_bytes),
         "flow_uuids_collected": len(uuids),
+        "flow_index_count": len(flow_index),
+        "archived_count": archived_count,
         "counts": counts,
         "count_mismatch": count_mismatch,
+        "index_mismatch": index_mismatch,
     }
 
 
