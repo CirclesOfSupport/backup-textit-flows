@@ -18,8 +18,49 @@ Cloud Run service: daily restore-capable backup of all TextIt flow definitions
    Backups** folder in the Circles of Support Shared Drive via the Drive API
    using the runtime service account (no rclone, no OAuth refresh token).
 
+6. **Retention prune** (ITDO-405 3-tier) runs after the upload succeeds. See below.
+
 `/health` (GET) → `{"status":"ok"}`. Both endpoints require GCP authentication;
 `/backup` additionally checks a body password.
+
+## Retention policy (3-tier)
+
+After each successful upload, `/backup` prunes the Text It Backups folder to:
+
+- **Daily** — keep every backup ≤ 30 days old.
+- **Weekly** — for 30 days–6 months (≤ 183 days), keep the newest backup in each
+  ISO week; trash the rest.
+- **Monthly** — older than 6 months (> 183 days), keep the newest backup in each
+  calendar month; trash the rest.
+
+Details:
+
+- **Keys on Drive file ID + `modifiedTime`, never filename** — a same-name
+  collision was historically possible (local MVP + cloud both wrote
+  `<date>_TextIt_backup.json` before the 2026-07-03 orchestrator cutover).
+  Filename `yyyymmdd` is used only as a cross-check.
+- **Only files ending `_TextIt_backup.json` are touched.** Anything else in the
+  folder is left strictly alone.
+- **Trash, not hard-delete.** Pruned files are moved to Drive Trash
+  (`trashed=true`), recoverable for the Trash-retention window — a mis-prune is
+  undoable.
+- **Blast-radius guard.** If the computed delete set exceeds
+  `RETENTION_MAX_DELETES` (60), the prune deletes **nothing** and returns
+  `needs_review: true`. First real prune against a large accumulated backlog may
+  exceed the cap — run `/prune` with `dry_run` first, review, and either raise
+  the cap deliberately or sweep in passes.
+- **A file dated today is never deleted**, independent of tier math.
+- **Prune failure never fails the backup** — the backup already landed; a prune
+  error is captured into the response under `retention`.
+
+Controls on `/backup` body: `"prune": false` skips pruning; `"prune_dry_run":
+true` computes and reports the delete set without trashing anything.
+
+### `POST /prune` — retention without a backup
+
+Runs the policy standalone (manual sweep / preview). Body `{"password": "...",
+"dry_run": true|false}`. **`dry_run` defaults to `true`** — a bare authenticated
+call is preview-only; deletion is opt-in with `"dry_run": false`.
 
 ## Config — Cloud Run console (NOT repo)
 
