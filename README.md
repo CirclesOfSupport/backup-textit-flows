@@ -1,8 +1,6 @@
 # backup-textit-flows
 
-Cloud Run service: daily restore-capable backup of all TextIt flow definitions
-(ITDO-405 phase 2). Cloud Run port of `backup_textit_flows.ps1`
-(kriton-dev/EarlyAlert).
+Cloud Run service: daily restore-capable backup of all TextIt flow definitions.
 
 ## What it does (`POST /backup`)
 
